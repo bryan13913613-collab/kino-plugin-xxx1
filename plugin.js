@@ -1,382 +1,472 @@
 /// <reference path="./kino.d.ts" />
-// Tu servidor -- a Kino plugin for a media server at home (Jellyfin, Emby, a NAS...), and the demo
-// plugin of the whole SDK: every feature a server of your own can use, up to apiVersion 7 (Kino 0.9.51),
-// is here, each one exercised by a title of the bundled reference server (README.md, "Every feature,
-// and where it is"). What is deliberately left out, and why, is in README.md, "What this plugin does
-// not use".
+// Xxx1 -- plugin de Kino con videos +18 de es.pornhub.com: búsqueda, filas de Inicio, "Ver más",
+// reproducción y descarga. Todo lo que devuelve va marcado `adult: true`: Kino lo muestra solo con el
+// código +18 de la persona desbloqueado, y este plugin nunca intenta saltarse ese candado, el aviso de
+// edad del sitio ni ninguna verificación o captcha: si el sitio pide una, la llamada termina con un error.
 //
-// The person types the server's address, user and password in its tab in Ajustes; the address (and
-// the other addresses of the same server they list) becomes an allowed host for this install only (the
-// manifest declares no host of its own: `"hosts": []`), so `http://` and a LAN address are both fine
-// here -- that would be refused for any host a plugin declares in its manifest. A loopback address
-// (127.0.0.1) is refused even here: on a phone it would mean the phone itself, never a real server.
-//
-// Run a real server to try this against: `node server.mjs` (see README.md), then, from your
-// computer's own LAN address (not 127.0.0.1 -- see above):
-//   node sdk/run.mjs . --config server=http://192.168.1.10:8096 --config user=ana --config password=s3cr3t search prueba
+// Qué está probado y qué no (versión 0.1.0):
+//   - search / browse: la lista de resultados se leyó de una página real guardada de la búsqueda.
+//   - home: usa las listas /video?o=cm y /video?o=mv con el mismo formato (sin probar con una página real).
+//   - resolve: busca "mediaDefinitions" en la página del video (sin probar con una página real).
 
-const VERSION = "1.5.0";
+const SITE = "https://es.pornhub.com";
 const HLS = "application/vnd.apple.mpegurl";
-
-const trimSlash = (u) => String(u).replace(/\/+$/, "");
-const base = () => trimSlash(kino.config.get("server") || "");
 const enc = encodeURIComponent;
 
-// The other addresses of the SAME server (the `list` setting "addresses": its LAN address and its public
-// name, say). Each `url` field is an allowed host too. Used three ways: the API falls back to them when
-// the main address does not answer (`reach`), every file gets them as labelled copies (`withAddresses`),
-// and the signed video as `alternateHosts` (`signedStream`).
-const addresses = () =>
-  (kino.config.get("addresses") || []).map((a) => ({ url: trimSlash(a.url), label: (a.label || "").trim() || new URL(a.url).host }));
+// Filas de Inicio. Cada `ref` ("o:<orden>") es lo que browse() recorre página por página.
+const ROWS = [
+  { id: "novedades", ref: "o:cm", es: "Recién agregados", en: "Recently added" },
+  { id: "mas-vistos", ref: "o:mv", es: "Más vistos", en: "Most viewed" },
+];
+const en = () => kino.lang === "en-US";
 
-// Everything cached in kino.storage belongs to one user on one server: storage survives a change
-// in Configurar, so a key without them would hand the old server's answers to the new one.
-const scope = () => kino.config.get("user") + "@" + base();
+// ---------- Leer el HTML (solo regex: no hay DOM en QuickJS) ----------
 
-// The token does NOT change when only the password changes for the same user@server -- a
-// still-valid token keeps working, exactly like a real session would, until the server rejects it.
-const tokenKey = () => "token:" + scope();
-
-// Who is asking, the way a Jellyfin client says it: Kino's version and language, this plugin's version, and
-// a random id for this install (kino.crypto.uuid, kept in kino.storage: per device, never in a setting --
-// settings travel to the person's other devices). Headers only, so the Node kit's recordings still match.
-function clientHeaders() {
-  let id = kino.storage.get("client-id");
-  if (!id) kino.storage.set("client-id", (id = kino.crypto.uuid()));
-  return {
-    "X-Client": `Kino/${kino.appVersion} own-server/${VERSION} api/${kino.apiVersion}`,
-    "X-Client-Id": id,
-    "Accept-Language": kino.lang,
-  };
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (m, n) => String.fromCodePoint(parseInt(n, 10)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
 }
 
-// One request, to the main address and, when it does not answer at all (network or timeout), to the other
-// addresses in order. A fallback is a degraded result even though the call works: kino.log.report tells
-// Kino's error tracker (the manifest declares `"telemetry": true`), at most once an hour per area.
-async function reach(path, init = {}) {
-  const options = { ...init, headers: { ...clientHeaders(), ...init.headers } };
-  try {
-    return await kino.fetch(base() + path, options);
-  } catch (e) {
-    if (e.code !== "network" && e.code !== "timeout") throw e;
-    const others = addresses();
-    for (let i = 0; i < others.length; i++) {
-      try {
-        const r = await kino.fetch(others[i].url + path, options);
-        kino.log.report("own_server:address", "main_unreachable", "fallback=" + (i + 1));
-        return r;
-      } catch (again) {
-        if (again.code !== "network" && again.code !== "timeout") throw again;
-      }
-    }
-    throw e;
+function first(re, text) {
+  const m = re.exec(text);
+  return m ? decodeEntities(m[1]).trim() : "";
+}
+
+// De una página de resultados o de una lista de videos saca { items, next }.
+function parseList(html, currentPage) {
+  const items = [];
+  const seen = {};
+  const chunks = String(html).split(/(?=<li[^>]*\sdata-video-vkey=")/);
+  for (const chunk of chunks) {
+    const key = /^<li[^>]*\sdata-video-vkey="([A-Za-z0-9]+)"/.exec(chunk);
+    if (!key) continue;
+    const id = key[1];
+    if (seen[id]) continue;
+    const block = chunk.split("</li>")[0];
+
+    let title = first(/class="thumbnailTitle"[^>]*>\s*([^<]+?)\s*</, block);
+    if (!title) title = first(/<img[^>]*\salt="([^"]+)"/, block);
+    if (!title) continue;
+
+    let poster = first(/<img[^>]*class="[^"]*videoThumb[^"]*"[^>]*\ssrc="([^"]+)"/, block);
+    if (!poster) poster = first(/\sdata-poster="([^"]+)"/, block);
+    if (poster && !/^https:\/\//.test(poster)) poster = "";
+
+    seen[id] = true;
+    items.push({
+      id,
+      title,
+      poster,
+      duration: first(/class="[^"]*\btime\b[^"]*"[^>]*>\s*([^<]+?)\s*</, block),
+      uploader: first(/class="uploaderLink[^"]*"[^>]*>\s*([^<]+?)\s*</, block),
+      views: first(/class="videoViews"[^>]*>\s*<i[^>]*><\/i>\s*([^<]+?)\s*</, block),
+    });
   }
-}
-
-async function token() {
-  await null;
-  const saved = kino.storage.get(tokenKey());
-  if (saved) return saved;
-  const r = await reach("/auth", {
-    method: "POST",
-    body: { json: { user: kino.config.get("user"), password: kino.config.get("password") } },
-  });
-  if (r.status === 401) throw kino.error("auth_required", "usuario o contraseña incorrectos");
-  if (!r.ok) throw kino.error("unavailable", "el servidor respondió " + r.status);
-  const t = r.json().token;
-  kino.storage.set(tokenKey(), t);
-  return t;
-}
-
-// Every request goes through here. A token invalidated server-side (expired, revoked, or a stale one
-// from before a real password change) is forgotten and the request tried once more with a fresh login.
-// A 429 that asks to wait at most 3 s is waited out once with kino.sleep (the wait counts inside the
-// call's own time limit). Every other failure becomes one of Kino's typed errors.
-async function api(path, { method = "GET", body, headers = {}, timeoutMs } = {}) {
-  const send = async () => reach(path, { method, body, timeoutMs, headers: { ...headers, "X-Token": await token() } });
-  let r = await send();
-  if (r.status === 401) {
-    kino.storage.remove(tokenKey());
-    r = await send();
+  // La página siguiente es el menor "page=N" que sea mayor que la actual.
+  let next = null;
+  const re = /(?:[?&]|&amp;)page=(\d+)/g;
+  let m;
+  while ((m = re.exec(html))) {
+    const n = parseInt(m[1], 10);
+    if (n > currentPage && (next === null || n < next)) next = n;
   }
-  const wait = Number(r.headers["retry-after"]);
-  if (r.status === 429 && wait > 0 && wait <= 3) {
-    await kino.sleep(wait * 1000);
-    r = await send();
-  }
-  if (r.status === 401) { kino.storage.remove(tokenKey()); throw kino.error("auth_required", "la sesión venció"); }
-  if (r.status === 400 || r.status === 404) throw kino.error("not_found", "el servidor respondió " + r.status);
-  if (r.status === 429) throw kino.error("rate_limited");
-  // Kino words the other codes itself; this one says more, as "Mensaje de Tu servidor: …" (kino.error's userMessage).
-  if (r.status === 451) throw kino.error("geo_blocked", "el servidor respondió 451", { userMessage: "Tu servidor no deja ver este título desde esta red." });
-  if (!r.ok) throw kino.error("unavailable", "el servidor respondió " + r.status);
-  return r.status === 204 ? null : r.json();
+  return { items, next };
 }
 
-// Artwork lives on the same typed server, so `http` and a LAN address are fine here too. Posters
-// are 2:3 (the cards), backdrops 16:9 (the info page's background, and each episode's still), the
-// logo a clear-logo on a transparent background (meta's `logo`).
-const art = (shape, id) => base() + "/img/" + shape + "/" + enc(id) + ".png";
-const poster = (id) => art("poster", id);
-const backdrop = (id) => art("backdrop", id);
+function minutes(duration) {
+  const p = String(duration).split(":").map(Number);
+  if (!p.length || p.some((n) => isNaN(n))) return undefined;
+  const seconds = p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + (p[1] || 0);
+  return Math.max(1, Math.round(seconds / 60));
+}
 
-// `kind` comes from the server: "movie", "series" (one season of a show) or "live" (apiVersion 2).
-// `ids` only when the server knows them: Kino then matches the title with TMDB and fills in its
-// info page (cast, director, tagline...). `adult: true` (apiVersion 6) keeps it behind the person's 18+ code.
-const item = (x) => ({
+const toItem = (x) => ({
   id: x.id,
   ref: x.id,
-  title: x.title,
-  kind: x.kind,
-  year: x.year,
-  poster: poster(x.id),
-  backdrop: backdrop(x.id),
-  overview: x.overview,
-  genres: x.genres ? x.genres.slice(0, 5) : undefined,
-  rating: x.rating,
-  runtimeMinutes: x.kind === "live" ? undefined : x.runtime,
-  badges: x.badges,
-  quality: x.quality,
-  lang: x.lang,
-  ids: x.tmdb || x.imdb ? { tmdb: x.tmdb, imdb: x.imdb } : undefined,
-  adult: x.adult || undefined,
+  title: x.title.slice(0, 200),
+  kind: "movie",
+  poster: x.poster || undefined,
+  overview: [x.uploader && (en() ? "By " : "De ") + x.uploader, x.views && x.views + (en() ? " views" : " vistas")].filter(Boolean).join(" · ") || undefined,
+  runtimeMinutes: minutes(x.duration),
+  adult: true,
 });
 
-// A browse ref (a Home or section row, a Categorías tile) as the server's filter: a kind, or "genre:<id>".
-function refFilter(ref) {
-  if (ref === "movie" || ref === "series" || ref === "live") return "kind=" + ref;
-  const genre = /^genre:([a-z0-9-]+)$/.exec(ref);
-  return genre ? "genre=" + genre[1] : null;
+// ---------- Red ----------
+
+async function getHtml(url) {
+  const r = await kino.fetch(url, { headers: { "Accept-Language": kino.lang }, timeoutMs: 12000 });
+  if (r.status === 404) throw kino.error("not_found", "el sitio respondió 404");
+  if (r.status === 429) throw kino.error("rate_limited");
+  if (r.status === 451) throw kino.error("geo_blocked", "el sitio respondió 451");
+  if (r.status === 403 || r.status === 503) {
+    // Nunca se intenta resolver una verificación: se termina la llamada.
+    throw kino.error("unavailable", "el sitio pidió una verificación (" + r.status + ")", {
+      userMessage: en() ? "The site asked for a check and this can't continue from here." : "El sitio pidió una verificación y no se puede continuar desde aquí.",
+    });
+  }
+  if (!r.ok) throw kino.error("unavailable", "el sitio respondió " + r.status);
+  return r.text();
 }
 
-// Home rows, one per kind; each row's ref is the kind, which browse() pages through. `genre` lines the
-// rows up with other plugins' in Categorías and the En vivo filter (the live row leaves it to Kino's guess).
-const ROWS = [
-  { id: "novedades", title: "Novedades", kind: "movie", genre: "peliculas" },
-  { id: "series", title: "Series", kind: "series", genre: "series" },
-  { id: "en-vivo", title: "En vivo", kind: "live" },
-];
+// ---------- Búsqueda, Inicio y "Ver más" ----------
 
-// Home asks the server three times; the answer is kept with a storage TTL the person picks ("Revisar lo
-// nuevo", a `select` setting), so opening Kino again right away costs no request. An expired entry reads
-// as null by itself. A copy without TTL ("home-last:") is the fallback when the server is down.
-export async function home() {
-  const key = "home:" + scope();
-  const cached = kino.storage.get(key);
-  if (cached) return JSON.parse(cached);
-  let rows;
-  try {
-    rows = [];
-    for (const row of ROWS) {
-      const p = await api("/items?limit=10&kind=" + row.kind);
-      if (p.items.length) rows.push({ id: row.id, title: row.title, ref: row.kind, genre: row.genre, items: p.items.map(item) });
-    }
-  } catch (e) {
-    const last = kino.storage.get("home-last:" + scope());
-    if (!last || !["unavailable", "network", "timeout"].includes(e.code)) throw e;
-    kino.log.report("own_server:home", "stale_rows", e.code);
-    return JSON.parse(last);
-  }
-  const minutes = Number(kino.config.get("homeTtl")) || 15;
-  kino.storage.set(key, JSON.stringify(rows), { ttlMs: minutes * 60 * 1000 });
-  kino.storage.set("home-last:" + scope(), JSON.stringify(rows));
-  return rows;
+export async function search(query) {
+  const q = String(query.q || "").trim();
+  if (!q) return [];
+  const page = Math.max(1, parseInt(query.cursor, 10) || 1);
+  const html = await getHtml(SITE + "/video/search?search=" + enc(q).replace(/%20/g, "+") + (page > 1 ? "&page=" + page : ""));
+  const { items, next } = parseList(html, page);
+  return { items: items.map(toItem), next: next ? String(next) : undefined };
+}
+
+function listUrl(ref, page) {
+  const m = /^o:([a-z]{2})$/.exec(String(ref));
+  if (!m) return null;
+  return SITE + "/video?o=" + m[1] + (page > 1 ? "&page=" + page : "");
 }
 
 export async function browse(ref, cursor) {
-  const filter = refFilter(ref);
-  if (!filter) throw kino.error("not_found", "fila desconocida");
-  const p = await api("/items?limit=10&" + filter + (cursor ? "&cursor=" + enc(cursor) : ""));
-  return { items: p.items.map(item), next: p.next || undefined };
+  await null;
+  const page = Math.max(1, parseInt(cursor, 10) || 1);
+  const url = listUrl(ref, page);
+  if (!url) throw kino.error("not_found", "fila desconocida");
+  const { items, next } = parseList(await getHtml(url), page);
+  return { items: items.map(toItem), next: next ? String(next) : undefined };
 }
 
-// The server matches ANY word of the query, so "Serie de prueba" also brings "Video de prueba 1".
-// kino.rank turns that into a title search: ask with the title's head, drop the stray-word hits,
-// best match first -- trying every form of the title Kino knows. `type` is only a hint: the kind it
-// names goes first, nothing is dropped for it. The answer is a Page: its `next` gets "Ver más resultados".
-// With `within` (the `scopedSearch` capability) the person is searching inside one of this plugin's
-// "Ver más" pages: the server searches that row's kind or genre only; null for a ref it cannot search.
+export async function home() {
+  const cached = kino.storage.get("home");
+  if (cached) return JSON.parse(cached);
+  const rows = [];
+  let lastError = null;
+  for (const row of ROWS) {
+    try {
+      const { items } = parseList(await getHtml(listUrl(row.ref, 1)), 1);
+      if (items.length) rows.push({ id: row.id, title: en() ? row.en : row.es, ref: row.ref, genre: "peliculas", items: items.slice(0, 20).map(toItem) });
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  if (!rows.length && lastError) throw lastError;
+  if (rows.length) kino.storage.set("home", JSON.stringify(rows), { ttlMs: 15 * 60 * 1000 });
+  return rows;
+}
+
+// ---------- Reproducir ----------
+
+// Saca el arreglo "mediaDefinitions" de la página del video (cuenta corchetes, ignora los de los textos).
+function mediaDefinitions(html) {
+  const k = html.indexOf('"mediaDefinitions"');
+  if (k < 0) return [];
+  const b = html.indexOf("[", k);
+  if (b < 0 || b - k > 40) return [];
+  let depth = 0, inStr = false, esc = false;
+  for (let i = b; i < html.length; i++) {
+    const c = html[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "[") depth++;
+    else if (c === "]" && --depth === 0) {
+      try { return JSON.parse(html.slice(b, i + 1)); } catch (e) { return []; }
+    }
+  }
+  return [];
+}
+
+function qualityOf(def) {
+  const q = Array.isArray(def.quality) ? Math.max(...def.quality.map(Number)) : Number(def.quality);
+  return q > 0 ? q : 0;
+}
+
+const absolute = (u) => (/^https?:\/\//.test(u) ? u : SITE + (u[0] === "/" ? "" : "/") + u);
+
+export async function resolve(ref) {
+  await null;
+  if (!/^[A-Za-z0-9]{1,32}$/.test(String(ref))) throw kino.error("not_found", "referencia no válida");
+  const html = await getHtml(SITE + "/view_video.php?viewkey=" + ref);
+  const defs = mediaDefinitions(html).filter((d) => d && d.videoUrl);
+  const found = [];
+
+  // Los "mp4" traen un enlace a una lista con una dirección por calidad (se pueden descargar).
+  const mp4 = defs.find((d) => d.format === "mp4");
+  if (mp4) {
+    try {
+      const r = await kino.fetch(absolute(mp4.videoUrl), { headers: { "Accept-Language": kino.lang, Referer: SITE + "/" }, timeoutMs: 8000 });
+      const list = r.ok ? r.json() : null;
+      if (Array.isArray(list)) {
+        for (const m of list) if (m && m.videoUrl && /mp4/i.test(m.format || "mp4")) found.push({ q: qualityOf(m), url: m.videoUrl, mime: "video/mp4" });
+      }
+    } catch (e) {
+      kino.log("resolve: lista mp4", e.code || "error");
+    }
+  }
+  // Los "hls" traen la dirección directa de la lista de reproducción.
+  for (const d of defs) if (d.format === "hls") found.push({ q: qualityOf(d), url: absolute(d.videoUrl), mime: HLS });
+
+  if (!found.length) {
+    throw kino.error("not_found", "sin enlaces de video", {
+      userMessage: en() ? "Couldn't find the video. It may have been removed or need a check." : "No se encontró el video. Puede haber sido retirado o pedir una verificación.",
+    });
+  }
+  // Primero los mp4 (sirven para descargar), de mayor a menor calidad; luego los hls.
+  found.sort((a, b) => (a.mime === b.mime ? b.q - a.q : a.mime === "video/mp4" ? -1 : 1));
+  const headers = { Referer: SITE + "/" };
+  const label = (f) => ((f.q ? f.q + "p" : "Auto") + (f.mime === HLS ? " · HLS" : "")).slice(0, 48);
+  const [main, ...rest] = found;
+  return {
+    url: main.url,
+    mime: main.mime,
+    headers,
+    label: label(main),
+    expiresInSeconds: 900,
+    alternatives: rest.slice(0, 8).map((f) => ({ label: label(f), url: f.url, mime: f.mime, headers })),
+  };
+}/// <reference path="./kino.d.ts" />
+// Xxx1 -- plugin de Kino con videos +18 de es.pornhub.com: búsqueda, filas de Inicio, "Ver más",
+// reproducción y descarga. Todo lo que devuelve va marcado `adult: true`: Kino lo muestra solo con el
+// código +18 de la persona desbloqueado, y este plugin nunca intenta saltarse ese candado, el aviso de
+// edad del sitio ni ninguna verificación o captcha: si el sitio pide una, la llamada termina con un error.
+//
+// Qué está probado y qué no (versión 0.1.0):
+//   - search / browse: la lista de resultados se leyó de una página real guardada de la búsqueda.
+//   - home: usa las listas /video?o=cm y /video?o=mv con el mismo formato (sin probar con una página real).
+//   - resolve: busca "mediaDefinitions" en la página del video (sin probar con una página real).
+
+const SITE = "https://es.pornhub.com";
+const HLS = "application/vnd.apple.mpegurl";
+const enc = encodeURIComponent;
+
+// Filas de Inicio. Cada `ref` ("o:<orden>") es lo que browse() recorre página por página.
+const ROWS = [
+  { id: "novedades", ref: "o:cm", es: "Recién agregados", en: "Recently added" },
+  { id: "mas-vistos", ref: "o:mv", es: "Más vistos", en: "Most viewed" },
+];
+const en = () => kino.lang === "en-US";
+
+// ---------- Leer el HTML (solo regex: no hay DOM en QuickJS) ----------
+
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (m, n) => String.fromCodePoint(parseInt(n, 10)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function first(re, text) {
+  const m = re.exec(text);
+  return m ? decodeEntities(m[1]).trim() : "";
+}
+
+// De una página de resultados o de una lista de videos saca { items, next }.
+function parseList(html, currentPage) {
+  const items = [];
+  const seen = {};
+  const chunks = String(html).split(/(?=<li[^>]*\sdata-video-vkey=")/);
+  for (const chunk of chunks) {
+    const key = /^<li[^>]*\sdata-video-vkey="([A-Za-z0-9]+)"/.exec(chunk);
+    if (!key) continue;
+    const id = key[1];
+    if (seen[id]) continue;
+    const block = chunk.split("</li>")[0];
+
+    let title = first(/class="thumbnailTitle"[^>]*>\s*([^<]+?)\s*</, block);
+    if (!title) title = first(/<img[^>]*\salt="([^"]+)"/, block);
+    if (!title) continue;
+
+    let poster = first(/<img[^>]*class="[^"]*videoThumb[^"]*"[^>]*\ssrc="([^"]+)"/, block);
+    if (!poster) poster = first(/\sdata-poster="([^"]+)"/, block);
+    if (poster && !/^https:\/\//.test(poster)) poster = "";
+
+    seen[id] = true;
+    items.push({
+      id,
+      title,
+      poster,
+      duration: first(/class="[^"]*\btime\b[^"]*"[^>]*>\s*([^<]+?)\s*</, block),
+      uploader: first(/class="uploaderLink[^"]*"[^>]*>\s*([^<]+?)\s*</, block),
+      views: first(/class="videoViews"[^>]*>\s*<i[^>]*><\/i>\s*([^<]+?)\s*</, block),
+    });
+  }
+  // La página siguiente es el menor "page=N" que sea mayor que la actual.
+  let next = null;
+  const re = /(?:[?&]|&amp;)page=(\d+)/g;
+  let m;
+  while ((m = re.exec(html))) {
+    const n = parseInt(m[1], 10);
+    if (n > currentPage && (next === null || n < next)) next = n;
+  }
+  return { items, next };
+}
+
+function minutes(duration) {
+  const p = String(duration).split(":").map(Number);
+  if (!p.length || p.some((n) => isNaN(n))) return undefined;
+  const seconds = p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + (p[1] || 0);
+  return Math.max(1, Math.round(seconds / 60));
+}
+
+const toItem = (x) => ({
+  id: x.id,
+  ref: x.id,
+  title: x.title.slice(0, 200),
+  kind: "movie",
+  poster: x.poster || undefined,
+  overview: [x.uploader && (en() ? "By " : "De ") + x.uploader, x.views && x.views + (en() ? " views" : " vistas")].filter(Boolean).join(" · ") || undefined,
+  runtimeMinutes: minutes(x.duration),
+  adult: true,
+});
+
+// ---------- Red ----------
+
+async function getHtml(url) {
+  const r = await kino.fetch(url, { headers: { "Accept-Language": kino.lang }, timeoutMs: 12000 });
+  if (r.status === 404) throw kino.error("not_found", "el sitio respondió 404");
+  if (r.status === 429) throw kino.error("rate_limited");
+  if (r.status === 451) throw kino.error("geo_blocked", "el sitio respondió 451");
+  if (r.status === 403 || r.status === 503) {
+    // Nunca se intenta resolver una verificación: se termina la llamada.
+    throw kino.error("unavailable", "el sitio pidió una verificación (" + r.status + ")", {
+      userMessage: en() ? "The site asked for a check and this can't continue from here." : "El sitio pidió una verificación y no se puede continuar desde aquí.",
+    });
+  }
+  if (!r.ok) throw kino.error("unavailable", "el sitio respondió " + r.status);
+  return r.text();
+}
+
+// ---------- Búsqueda, Inicio y "Ver más" ----------
+
 export async function search(query) {
-  if (query.within !== undefined) {
-    const filter = refFilter(query.within);
-    if (!filter) return null;
-    const p = await api("/items?limit=50&" + filter + "&q=" + enc(query.q) + (query.cursor ? "&cursor=" + enc(query.cursor) : ""));
-    return { items: kino.rank.filterRelevant(p.items, query.q).map(item), next: p.next || undefined };
+  const q = String(query.q || "").trim();
+  if (!q) return [];
+  const page = Math.max(1, parseInt(query.cursor, 10) || 1);
+  const html = await getHtml(SITE + "/video/search?search=" + enc(q).replace(/%20/g, "+") + (page > 1 ? "&page=" + page : ""));
+  const { items, next } = parseList(html, page);
+  return { items: items.map(toItem), next: next ? String(next) : undefined };
+}
+
+function listUrl(ref, page) {
+  const m = /^o:([a-z]{2})$/.exec(String(ref));
+  if (!m) return null;
+  return SITE + "/video?o=" + m[1] + (page > 1 ? "&page=" + page : "");
+}
+
+export async function browse(ref, cursor) {
+  await null;
+  const page = Math.max(1, parseInt(cursor, 10) || 1);
+  const url = listUrl(ref, page);
+  if (!url) throw kino.error("not_found", "fila desconocida");
+  const { items, next } = parseList(await getHtml(url), page);
+  return { items: items.map(toItem), next: next ? String(next) : undefined };
+}
+
+export async function home() {
+  const cached = kino.storage.get("home");
+  if (cached) return JSON.parse(cached);
+  const rows = [];
+  let lastError = null;
+  for (const row of ROWS) {
+    try {
+      const { items } = parseList(await getHtml(listUrl(row.ref, 1)), 1);
+      if (items.length) rows.push({ id: row.id, title: en() ? row.en : row.es, ref: row.ref, genre: "peliculas", items: items.slice(0, 20).map(toItem) });
+    } catch (e) {
+      lastError = e;
+    }
   }
-  if (!query.q.trim()) return [];
-  const titles = [query.q, query.originalTitle, ...(query.altTitles || [])].filter(Boolean);
-  const p = await api("/items?limit=50&q=" + enc(kino.rank.shortQuery(query.q)) + (query.cursor ? "&cursor=" + enc(query.cursor) : ""));
-  const best = kino.rank.sortBySimilarity(kino.rank.filterRelevant(p.items, titles), titles);
-  const wanted = query.type === "movie" || query.type === "series" ? query.type : null;
-  const ordered = wanted ? [...best.filter((x) => x.kind === wanted), ...best.filter((x) => x.kind !== wanted)] : best;
-  return { items: ordered.map(item), next: p.next || undefined };
+  if (!rows.length && lastError) throw lastError;
+  if (rows.length) kino.storage.set("home", JSON.stringify(rows), { ttlMs: 15 * 60 * 1000 });
+  return rows;
 }
 
-// Each season is its own title on this server, so the answer lists every season of the show in
-// `seasons` (the one being answered marked `current`): Kino shows them as chips and calls
-// episodes() again with the chosen season's ref.
-export async function episodes(ref) {
-  const x = await api("/items/" + enc(ref));
-  if (x.kind !== "series") throw kino.error("not_found");
-  return {
-    series: { title: x.show.title, overview: x.show.overview, poster: poster(x.id), backdrop: backdrop(x.id), genres: x.genres, year: x.year },
-    episodes: x.episodes.map((e) => ({
-      season: x.season, number: e.number, ref: e.id, title: e.title, still: backdrop(e.id),
-      overview: e.overview, airDate: e.airDate, runtimeMinutes: e.runtime,
-    })),
-    seasons: x.seasons.map((s) => ({
-      id: s.id,
-      ref: s.id,
-      title: "Temporada " + s.number,
-      number: s.number,
-      current: s.id === x.id,
-    })),
-  };
-}
+// ---------- Reproducir ----------
 
-// Movies and episodes are progressive mp4 files, so with `download` declared Kino can save them;
-// the live channels are HLS and play as live (never downloadable). A movie with a separate audio
-// file gets it as an `audioTracks` entry, merged by the player and picked in its audio menu; its
-// subtitles go in `subtitles`; its length in `durationMs` and, when the server knows where THIS file's
-// opening and ending are, `skip` ("Saltar intro" / "Saltar outro").
-// `options.retry` (apiVersion 6) comes only after the origin refused a signed stream: see signedStream.
-export async function resolve(ref, options) {
-  // An entry of the list declared with `resolve: true` (liveCategories): its link needs the token.
-  if (/\/channels\/[^/]+\/play$/.test(ref)) return resolveListEntry(ref);
-  // A lazy copy's own ref ("<title>|<copy>", see below): Kino asks for it only when the person picks that
-  // copy in the player's Servidor menu, the fallback reaches it or a download's copy choice does.
-  if (ref.includes("|")) return resolveCopy(ref);
-  const retry = options && options.retry;
-  if (retry) kino.log("resolve: retry", retry.reason, retry.attempt, retry.status || "-");
-  const x = await api("/items/" + enc(ref) + (retry ? "?fresh=1" : ""));
-  if (x.kind === "live") return { url: base() + x.stream, mime: HLS, headers: agentHeaders() };
-  if (x.hls) return signedStream(x);
-  const path = x.stream + (kino.config.get("hd") ? "?quality=hd" : "");
-  const stream = {
-    url: base() + path,
-    mime: "video/mp4",
-    // The token is short-lived server-side (see server.mjs); resolve again once it's stale.
-    expiresInSeconds: 600,
-  };
-  if (x.durationMs) stream.durationMs = x.durationMs;
-  if (x.skip) stream.skip = x.skip;
-  if (x.subtitles && x.subtitles.length) {
-    stream.subtitles = x.subtitles.map((s) => ({ lang: s.lang, url: base() + s.file, format: s.format }));
+// Saca el arreglo "mediaDefinitions" de la página del video (cuenta corchetes, ignora los de los textos).
+function mediaDefinitions(html) {
+  const k = html.indexOf('"mediaDefinitions"');
+  if (k < 0) return [];
+  const b = html.indexOf("[", k);
+  if (b < 0 || b - k > 40) return [];
+  let depth = 0, inStr = false, esc = false;
+  for (let i = b; i < html.length; i++) {
+    const c = html[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "[") depth++;
+    else if (c === "]" && --depth === 0) {
+      try { return JSON.parse(html.slice(b, i + 1)); } catch (e) { return []; }
+    }
   }
-  if (x.audio && x.audio.length) {
-    stream.audioTracks = x.audio.map((a) => ({ lang: a.lang, label: a.label, url: base() + a.stream }));
+  return [];
+}
+
+function qualityOf(def) {
+  const q = Array.isArray(def.quality) ? Math.max(...def.quality.map(Number)) : Number(def.quality);
+  return q > 0 ? q : 0;
+}
+
+const absolute = (u) => (/^https?:\/\//.test(u) ? u : SITE + (u[0] === "/" ? "" : "/") + u);
+
+export async function resolve(ref) {
+  await null;
+  if (!/^[A-Za-z0-9]{1,32}$/.test(String(ref))) throw kino.error("not_found", "referencia no válida");
+  const html = await getHtml(SITE + "/view_video.php?viewkey=" + ref);
+  const defs = mediaDefinitions(html).filter((d) => d && d.videoUrl);
+  const found = [];
+
+  // Los "mp4" traen un enlace a una lista con una dirección por calidad (se pueden descargar).
+  const mp4 = defs.find((d) => d.format === "mp4");
+  if (mp4) {
+    try {
+      const r = await kino.fetch(absolute(mp4.videoUrl), { headers: { "Accept-Language": kino.lang, Referer: SITE + "/" }, timeoutMs: 8000 });
+      const list = r.ok ? r.json() : null;
+      if (Array.isArray(list)) {
+        for (const m of list) if (m && m.videoUrl && /mp4/i.test(m.format || "mp4")) found.push({ q: qualityOf(m), url: m.videoUrl, mime: "video/mp4" });
+      }
+    } catch (e) {
+      kino.log("resolve: lista mp4", e.code || "error");
+    }
   }
-  if (x.copies && x.copies.length) return withCopies(ref, stream, x.copies);
-  return withAddresses(stream, path);
-}
+  // Los "hls" traen la dirección directa de la lista de reproducción.
+  for (const d of defs) if (d.format === "hls") found.push({ q: qualityOf(d), url: absolute(d.videoUrl), mime: HLS });
 
-// The same file at the server's other addresses: labelled copies Kino moves to by itself, at the same
-// spot, when the main address stops answering mid-film (apiVersion 6 labels, in the player's Servidor menu).
-function withAddresses(stream, path) {
-  const others = addresses();
-  if (!others.length) return stream;
-  return {
-    ...stream,
-    label: "Dirección principal",
-    alternatives: others.slice(0, 8).map((a) => ({ label: a.label.slice(0, 48), url: a.url + path, mime: stream.mime })),
-  };
-}
-
-// Labelled copies (apiVersion 6): the same video on several servers. The Stream carries its own `label`
-// and `alternatives`; the player lists them all, by label, in its Servidor menu. A copy whose stream the
-// title's answer already has is a plain `{ label, url }`; one that takes another request to find is a
-// lazy `{ label, ref }`: Kino calls resolve(ref) for it only when it is needed, so opening the title
-// never pays for it. The ref names that one copy ("<title>|<copy>") because it may be resolved minutes
-// after the title was.
-const copyLabel = (c) => c.lang + " · " + c.name;
-
-function withCopies(ref, stream, copies) {
-  const [first, ...rest] = copies;
-  return {
-    ...stream,
-    url: base() + first.stream,
-    label: copyLabel(first),
-    alternatives: rest.map((c) =>
-      c.stream
-        ? { label: copyLabel(c), url: base() + c.stream, mime: "video/mp4" }
-        : { label: copyLabel(c), ref: ref + "|" + c.id },
-    ),
-  };
-}
-
-// One copy on its own. Its own `alternatives` would be ignored (a copy never expands into more copies).
-async function resolveCopy(ref) {
-  const [id, copy] = ref.split("|");
-  try {
-    const c = await api("/items/" + enc(id) + "/copies/" + enc(copy));
-    return { url: base() + c.stream, mime: "video/mp4", expiresInSeconds: 600 };
-  } catch (e) {
-    if (e.code === "not_found") throw kino.error("not_found", "copia " + copy, { userMessage: "Esa copia ya no está en tu servidor; prueba con otra del menú Servidor." });
-    throw e;
+  if (!found.length) {
+    throw kino.error("not_found", "sin enlaces de video", {
+      userMessage: en() ? "Couldn't find the video. It may have been removed or need a check." : "No se encontró el video. Puede haber sido retirado o pedir una verificación.",
+    });
   }
-}
-
-// Signing every request (apiVersion 6): this server wants each playlist and segment request of the
-// protected video to carry a signature that is only good for 30 s -- no URL token could last a whole
-// film. Kino plays the stream through its local proxy and calls sign() right before every request. What
-// sign() needs travels in `signContext` (it runs apart and cannot read kino.storage); the session id goes
-// as a plain header. `alternateHosts`: the other addresses of the same server (same scheme), which Kino
-// tries when the main one fails. If the server still refuses (409, or 401/403 twice), Kino calls
-// resolve(ref, { retry }) and the server is asked for a fresh session (`?fresh=1` above).
-function signedStream(x) {
-  const scheme = new URL(base()).protocol;
-  const hosts = addresses().filter((a) => new URL(a.url).protocol === scheme).map((a) => new URL(a.url).host);
+  // Primero los mp4 (sirven para descargar), de mayor a menor calidad; luego los hls.
+  found.sort((a, b) => (a.mime === b.mime ? b.q - a.q : a.mime === "video/mp4" ? -1 : 1));
+  const headers = { Referer: SITE + "/" };
+  const label = (f) => ((f.q ? f.q + "p" : "Auto") + (f.mime === HLS ? " · HLS" : "")).slice(0, 48);
+  const [main, ...rest] = found;
   return {
-    url: base() + x.hls,
-    mime: HLS,
-    headers: { "X-Session": x.session.id },
-    signing: "request",
-    signContext: JSON.stringify({ key: x.session.key }),
-    ...(hosts.length ? { alternateHosts: hosts.slice(0, 6) } : {}),
+    url: main.url,
+    mime: main.mime,
+    headers,
+    label: label(main),
+    expiresInSeconds: 900,
+    alternatives: rest.slice(0, 8).map((f) => ({ label: label(f), url: f.url, mime: f.mime, headers })),
   };
-}
-
-// Headers for ONE request of a signed stream, computed with kino.crypto only (1.5 s; no network, no
-// storage). `url` is always the address of the host being asked, so the path signed is the right one.
-export async function sign({ url, context }) {
-  const { key } = JSON.parse(context);
-  const time = String(Math.floor(Date.now() / 1000));
-  const path = new URL(url).pathname;
-  return { headers: { "X-Time": time, "X-Signature": kino.crypto.hmac("sha256", key, time + ":" + path) } };
-}
-
-// Some channels only answer a known player: the person can type the User-Agent Kino presents (Configurar ->
-// "User-Agent de los canales"). It goes to the player in all three shapes below -- `headers` on a Stream
-// (a `ref` channel's resolve() answer, an inline `stream`) and `streamHeaders` on a playlist -- and to
-// nothing else. Left empty, nothing is added and Kino sends its own.
-const agentHeaders = () => {
-  const agent = String(kino.config.get("userAgent") || "").trim();
-  return agent ? { "User-Agent": agent } : undefined;
-};
-
-// apiVersion 3's `channels`: Tu servidor's channels in Kino's own En vivo tab (phone tab, TV guide,
-// channel drawer), next to -- not instead of -- the "En vivo" Home row above. They show all three
-// shapes a plugin can give, mixed in one answer:
-//   Noticias  -- channels with a `ref`: Kino sends it to resolve() above when the person plays one
-//                (per-channel logic, fresh tokens...); the ref is the item id resolve() already knows;
-//   Deportes  -- channels with an inline `stream`: they play with no call to the plugin at all
-//                (the fastest zapping), checked by the same rules as resolve()'s answer; their `ref`
-//                is only the fallback;
-//   playlists -- M3U lists and an XMLTV guide that KINO downloads and parses itself (thousands of
-//                channels, no JS): their entries become categories named after their groups. The
-//                second one's links need the token, so it says `resolve: true` and each entry plays
-//                through resolve(<entry url>).
-// Each category and list carries a `genre`, so Kino's En vivo filter lines them up with other providers'.
-export async function liveCategories() {
-  const categories = await api("/channels/categories");
-  const t = await token();
-  return [
-    ...categories,
-    {
-      playlist: {
-        url: base() + "/lista.m3u",
-        format: "m3u",
-        // Sent with the list and guide downloads: this server wants its token there too.
+}s token there too.
         headers: { "X-Token": t },
         // Sent by the PLAYER with every channel of this list (apart from `headers` above: the token goes only to
         // this server's list, never to the hosts the channels are on). An entry that names its own agent wins.
