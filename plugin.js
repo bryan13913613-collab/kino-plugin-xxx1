@@ -213,7 +213,13 @@ export async function resolve(ref) {
   }
   // Los "hls" traen la dirección directa de la lista de reproducción.
   for (const d of defs) if (d.format === "hls") found.push({ q: x1Quality(d), url: x1Abs(d.videoUrl), mime: X1_HLS });
-
+  // Respaldo: la página trae un mp4 directo en la etiqueta og:video (suele ser de baja calidad).
+  const og = x1First(/<meta[^>]*property="og:video:secure_url"[^>]*content="([^"]+)"/, html) || x1First(/<meta[^>]*property="og:video"[^>]*content="([^"]+)"/, html);
+  if (/^https:\/\//.test(og) && !found.some((f) => f.url === og)) {
+    const mq = /\/(\d{3,4})P_/.exec(og);
+    found.push({ q: mq ? Number(mq[1]) : 0, url: og, mime: "video/mp4" });
+  }
+  kino.log("resolve: defs", defs.length, "enlaces", found.length);
   if (!found.length) {
     throw kino.error("not_found", "sin enlaces de video", {
       userMessage: x1En() ? "Couldn't find the video. It may have been removed or need a check." : "No se encontró el video. Puede haber sido retirado o pedir una verificación.",
